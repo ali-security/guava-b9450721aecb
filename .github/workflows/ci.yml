@@ -1,12 +1,12 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional surefire -Dtest selector; empty runs the full suite'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -17,7 +17,9 @@ jobs:
       actions: write  # for styfle/cancel-workflow-action to cancel/stop running workflows
       contents: read  # for actions/checkout to fetch code
     name: "${{ matrix.root-pom }} on JDK ${{ matrix.java }} on ${{ matrix.os }}"
+    timeout-minutes: 50
     strategy:
+      fail-fast: false
       matrix:
         os: [ ubuntu-latest ]
         java: [ 8, 11, 17, 21 ]
@@ -54,7 +56,52 @@ jobs:
         run: ./mvnw -B -ntp -Dtoolchain.skip install -U -DskipTests=true -f $ROOT_POM
       - name: 'Test'
         shell: bash
-        run: ./mvnw -B -ntp -P!standard-with-extra-repos -Dtoolchain.skip verify -U -Dmaven.javadoc.skip=true -Dsurefire.toolchain.version=${{ matrix.java }} -f $ROOT_POM
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./mvnw -B -ntp -P!standard-with-extra-repos -Dtoolchain.skip verify -U -Dmaven.javadoc.skip=true -Dsurefire.toolchain.version=${{ matrix.java }} -f $ROOT_POM -Dtest="${{ inputs.test-filter }}" -Dsurefire.failIfNoSpecifiedTests=false
+          else
+            ./mvnw -B -ntp -P!standard-with-extra-repos -Dtoolchain.skip verify -U -Dmaven.javadoc.skip=true -Dsurefire.toolchain.version=${{ matrix.java }} -f $ROOT_POM
+          fi
+      - name: 'Print skipped tests with reasons'
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          PY=python3; command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' >/dev/null 2>&1 || PY=python
+          "$PY" - <<'PYEOF'
+          import glob, os, collections
+          import xml.etree.ElementTree as ET
+          totals = collections.OrderedDict()
+          for f in sorted(glob.glob('**/target/surefire-reports/TEST-*.xml', recursive=True)):
+              module = f.split(os.sep + 'target' + os.sep)[0].replace(os.sep, '/')
+              t = totals.setdefault(module, [0, 0, 0, 0])
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception as e:
+                  print('could not parse %s: %s' % (f, e))
+                  continue
+              suites = [root] if root.tag == 'testsuite' else root.findall('testsuite')
+              for su in suites:
+                  for tc in su.findall('testcase'):
+                      t[0] += 1
+                      sk = tc.find('skipped')
+                      if tc.find('failure') is not None:
+                          t[2] += 1
+                      elif tc.find('error') is not None:
+                          t[3] += 1
+                      elif sk is not None:
+                          t[1] += 1
+                          msg = (sk.get('message') or (sk.text or '')).strip().replace('\n', ' ')
+                          print('SKIPPED %s.%s -- reason: %s' % (tc.get('classname'), tc.get('name'), msg or 'no message (assumption failed)'))
+          for m, (run, skipped, failed, errors) in totals.items():
+              print('MODULE %s: tests=%d passed=%d skipped=%d failures=%d errors=%d' % (m, run, run - skipped - failed - errors, skipped, failed, errors))
+          PYEOF
+      - name: 'Upload guava jar'
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.java == 17 && matrix.root-pom == 'pom.xml' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: guava-jar
+          path: guava/target/guava-33.6.0-jre.jar
+          if-no-files-found: error
       - name: 'Print Surefire reports'
         # Note: Normally a step won't run if the job has failed, but this causes it to
         if: ${{ failure() }}
@@ -71,6 +118,7 @@ jobs:
   publish_snapshot:
     name: 'Publish snapshot'
     needs: test
+    timeout-minutes: 30
     if: github.event_name == 'push' && github.repository == 'google/guava'
     runs-on: ubuntu-latest
     steps:
@@ -98,6 +146,7 @@ jobs:
       contents: write
     name: 'Generate latest docs'
     needs: test
+    timeout-minutes: 30
     if: github.event_name == 'push' && github.repository == 'google/guava'
     runs-on: ubuntu-latest
     steps:
